@@ -562,6 +562,101 @@ def detect_primary_resolution_mutter(bus) -> Optional[tuple]:
     return None
 
 
+def find_virtual_monitor_connector(bus) -> Optional[str]:
+    """Return the "Meta-N" connector Mutter uses for its virtual monitor, or None.
+    Mutter only registers this after the PipeWire consumer has attached, so call
+    it lazily (from a MonitorsChanged handler) rather than right after RecordVirtual.
+    """
+    try:
+        proxy = bus.get_object("org.gnome.Mutter.DisplayConfig",
+                               "/org/gnome/Mutter/DisplayConfig")
+        iface = dbus.Interface(proxy, "org.gnome.Mutter.DisplayConfig")
+        _, monitors, _, _ = iface.GetCurrentState()
+        for m in monitors:
+            conn = str(m[0][0])
+            if conn.startswith("Meta-"):
+                return conn
+    except Exception as e:
+        log.debug("find_virtual_monitor_connector failed: %s", e)
+    return None
+
+
+def get_logical_monitor_scale(bus, connector: str) -> Optional[float]:
+    """Return the scale of the logical monitor containing `connector`, or None."""
+    try:
+        proxy = bus.get_object("org.gnome.Mutter.DisplayConfig",
+                               "/org/gnome/Mutter/DisplayConfig")
+        iface = dbus.Interface(proxy, "org.gnome.Mutter.DisplayConfig")
+        _, _, logical_monitors, _ = iface.GetCurrentState()
+        for lm in logical_monitors:
+            if any(str(m[0]) == connector for m in lm[5]):
+                return float(lm[2])
+    except Exception as e:
+        log.debug("get_logical_monitor_scale(%s) failed: %s", connector, e)
+    return None
+
+
+def apply_logical_monitor_scale(bus, connector: str, scale: float) -> bool:
+    """Rewrite the current monitor layout with `connector`'s scale set to `scale`,
+    all other logical monitors copied verbatim. Uses method=1 (temporary) so the
+    change isn't persisted to monitors.xml. Returns True on success.
+
+    GetCurrentState's logical_monitors carries monitor refs as (connector, vendor,
+    product, serial); ApplyMonitorsConfig wants (connector, mode_id, properties).
+    The transformation happens here.
+    """
+    try:
+        proxy = bus.get_object("org.gnome.Mutter.DisplayConfig",
+                               "/org/gnome/Mutter/DisplayConfig")
+        iface = dbus.Interface(proxy, "org.gnome.Mutter.DisplayConfig")
+        serial, monitors, logical_monitors, _ = iface.GetCurrentState()
+        current_mode_by_conn = {}
+        for mon in monitors:
+            conn = str(mon[0][0])
+            for mode in mon[1]:
+                if mode[6].get("is-current", False):
+                    current_mode_by_conn[conn] = str(mode[0])
+                    break
+        new_lms = []
+        found = False
+        for lm in logical_monitors:
+            x, y, cur_scale, transform, primary, monitors_ref, _lm_props = lm
+            connectors_here = [str(m[0]) for m in monitors_ref]
+            is_ours = connector in connectors_here
+            if is_ours:
+                found = True
+            use_scale = float(scale) if is_ours else float(cur_scale)
+            monitors_config = dbus.Array([
+                dbus.Struct((
+                    dbus.String(c),
+                    dbus.String(current_mode_by_conn.get(c, "")),
+                    dbus.Dictionary({}, signature="sv"),
+                ), signature="ssa{sv}")
+                for c in connectors_here
+            ], signature="(ssa{sv})")
+            new_lms.append(dbus.Struct((
+                dbus.Int32(int(x)),
+                dbus.Int32(int(y)),
+                dbus.Double(use_scale),
+                dbus.UInt32(int(transform)),
+                dbus.Boolean(bool(primary)),
+                monitors_config,
+            ), signature="iiduba(ssa{sv})"))
+        if not found:
+            log.debug("apply_logical_monitor_scale: connector %s not present", connector)
+            return False
+        iface.ApplyMonitorsConfig(
+            dbus.UInt32(serial),
+            dbus.UInt32(1),  # 1 = temporary, not written to monitors.xml
+            dbus.Array(new_lms, signature="(iiduba(ssa{sv}))"),
+            dbus.Dictionary({}, signature="sv"),
+        )
+        return True
+    except Exception as e:
+        log.warning("apply_logical_monitor_scale(%s, %.3f) failed: %s", connector, scale, e)
+        return False
+
+
 def detect_primary_resolution_xrandr() -> Optional[tuple]:
     try:
         result = subprocess.run(["xrandr", "--query"], capture_output=True,
@@ -1980,6 +2075,12 @@ class ServerCore:
         self._display: Optional[MutterVirtualDisplay] = None
         self._capture: Optional[PipeWireCapture]      = None
         self._conn:    Optional[socket.socket]        = None  # active client socket
+        # "Meta-N" connector Mutter registered for our virtual monitor, or None
+        # until the first MonitorsChanged event after the pipeline goes PLAYING.
+        self._virtual_monitor_connector: Optional[str] = None
+        # Scale the user set on the virtual monitor before a stall-triggered
+        # teardown; re-applied on the reconnect so the choice survives the blip.
+        self._preserved_scale: Optional[float] = None
         self._input_negotiated: bool = False  # set per-connection in
                                                # _handle_client; whether this
                                                # client both advertised input
@@ -2077,10 +2178,30 @@ class ServerCore:
     def _on_monitors_changed(self):
         """
         Fires when GNOME Display Settings applies a new monitor configuration.
-        We do NOT release the stream here — for layout-only changes (e.g. mirror,
-        position) Mutter doesn't destroy the PipeWire node, so the stream survives
-        and the user's GNOME layout choice is preserved. If Mutter does destroy the
-        node (e.g. resolution change), GStreamer's error/EOS handler cleans up.
+
+        Two things can happen and we handle them in the same handler:
+
+        - **We have a saved scale to re-apply.** This is the first
+          MonitorsChanged after a reconnect — Mutter has just registered the
+          fresh virtual monitor as "Meta-N", so we can identify it and push
+          the user's previous scale back onto it via ApplyMonitorsConfig.
+
+        - **The user changed something.** Scale, arrangement, rotation. Most
+          of these cause Mutter to silently pause PipeWire buffer delivery
+          without any GStreamer event we can react to — the src pad goes
+          quiet, encoded frame count freezes, and it does not recover on its
+          own (state cycling pipewiresrc reconnects the PipeWire client but
+          only nets one damage frame before the compositor's clock gets
+          confused by the fresh SEGMENT). The reliable recovery is a full
+          teardown + reconnect, but we only want to trigger it on an actual
+          stall — so arm a watchdog: 1.5s from now, if encoded didn't
+          advance, snapshot the current virtual monitor scale and drop the
+          client. The reconnect creates a fresh monitor at scale 1.0; when
+          MonitorsChanged fires for that new monitor's registration, the
+          first branch above re-applies the saved scale.
+
+        If Mutter really destroyed the PipeWire node, GStreamer's error/EOS
+        handler still cleans up.
         """
         if not self._bus or not self._state.running:
             return
@@ -2088,6 +2209,52 @@ class ServerCore:
             detected = detect_primary_resolution_mutter(self._bus)
             if detected:
                 self._log(f"Monitor config updated — next stream: {detected[0]}×{detected[1]}")
+
+        # Late-bind the virtual monitor's connector (only registered once the
+        # PipeWire consumer has attached).
+        if self._virtual_monitor_connector is None:
+            self._virtual_monitor_connector = find_virtual_monitor_connector(self._bus)
+            if self._virtual_monitor_connector:
+                log.info("Virtual monitor connector: %s", self._virtual_monitor_connector)
+
+        # Path 1: re-apply preserved scale.
+        if (self._preserved_scale is not None
+                and self._virtual_monitor_connector is not None):
+            scale = self._preserved_scale
+            self._preserved_scale = None
+            if apply_logical_monitor_scale(
+                self._bus, self._virtual_monitor_connector, scale,
+            ):
+                self._log(f"Restored virtual monitor scale {scale:g}×")
+            return
+
+        # Path 2: arm the stall watchdog.
+        capture = self._capture
+        conn = self._conn
+        if capture is None or conn is None:
+            return
+        baseline = capture.metrics.snapshot().get("frames_encoded", 0)
+        connector = self._virtual_monitor_connector
+
+        def _check_stall():
+            if self._capture is not capture:
+                return False  # session already torn down for another reason
+            cur = capture.metrics.snapshot().get("frames_encoded", 0)
+            if cur != baseline:
+                return False
+            if connector:
+                cur_scale = get_logical_monitor_scale(self._bus, connector)
+                if cur_scale is not None and abs(cur_scale - 1.0) > 1e-6:
+                    self._preserved_scale = cur_scale
+                    self._log(f"Preserving virtual monitor scale {cur_scale:g}× across reconnect")
+            self._log("Stream stalled after config change — reconnecting")
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return False
+
+        GLib.timeout_add(1500, _check_stall)
 
 
     def _accept_loop(self) -> None:
@@ -2737,6 +2904,7 @@ class ServerCore:
             if display:
                 display.close()
                 self._display = None
+                self._virtual_monitor_connector = None
             # Mandatory cooldown to prevent Mutter crashes on immediate reconnect
             time.sleep(1.0)
             self._client_lock.release()
