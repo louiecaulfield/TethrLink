@@ -192,7 +192,7 @@ Override the whole thing with `TETHRLINK_RES` if you would rather trade decode h
 
 **A constant frame rate is manufactured downstream.** Mutter's capture is damage-driven: a display showing something static stops producing frames entirely. A `compositor` element running on its own clock supplies a steady rate at zero added latency, so motion resumes instantly instead of after a stall.
 
-**Buffering is kept deliberately shallow** — about four frames in flight, roughly 133 ms at 30 fps. A deeper queue would hide jitter, but at the cost of latency on *every* frame.
+**Buffering is kept deliberately shallow** — three frames in flight, roughly 100 ms at 30 fps. A deeper queue would hide jitter, but at the cost of latency on *every* frame.
 
 ---
 

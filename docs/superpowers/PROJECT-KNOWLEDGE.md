@@ -77,7 +77,7 @@ plain Kotlin.
   | 33 ms | 30, 30, 30, 30, 30 |
 
   `latency=0` is used, because pipeline buffering was deliberately cut to
-  ~133 ms and giving any back would undo that.
+  ~100 ms and giving any back would undo that.
   **Cost:** an idle session now holds ~0.4 core, versus ~0 before. That is
   inherent to producing 30 fps, not a compositor inefficiency.
 

@@ -115,13 +115,16 @@ APPSINK_MAX_BUFFERS = 2
 # this fix. These three depths (leaky queue upstream of the encoder, the
 # H.264 appsink, and the lossless FIFO) together bounded the H.264 path at
 # roughly 8 frames (~265ms at 30fps) of pure pre-render buffering, which was
-# the dominant source of reported pointer lag. Shrinking them to ~4 frames
-# (~133ms) trades a higher chance of FIFO overflow — which costs one brief
-# keyframe resync — for lower latency on every single frame. Do not raise
-# these back up without accounting for that trade.
+# the dominant source of reported pointer lag. Shrunk to the theoretical
+# minimum of 3 frames (~100ms at 30fps): one raw frame upstream of the
+# encoder, one encoded frame in the appsink, one in the send FIFO. Each
+# overflow costs one keyframe resync (an IDR-sized bandwidth spike plus a
+# brief quality dip), so under sustained downstream backpressure this will
+# resync more often than the previous FIFO=2. Do not raise these back up
+# without accounting for that trade.
 H264_LEAKY_QUEUE_MAX_BUFFERS = 1
 H264_APPSINK_MAX_BUFFERS     = 1
-H264_FIFO_MAXSIZE            = 2
+H264_FIFO_MAXSIZE            = 1
 
 # ── Mutter constants ──────────────────────────────────────────────────────────
 MUTTER_BUS    = "org.gnome.Mutter.ScreenCast"
@@ -454,7 +457,7 @@ class ServerConfig:
     # High Speed (480 Mbit/s theoretical, ~200–300 Mbit/s realistic) —
     # verified on the live device. `gop_length` is derived from the live fps
     # at session start, so the keyframe interval follows automatically.
-    fps: int = 30
+    fps: int = 50
     quality: int = 90
     # H.264 is the default as of this release, not JPEG. It used to be the
     # other way around because the H.264 path was genuinely broken — it
@@ -1556,7 +1559,7 @@ class PipeWireCapture:
                 # rather than "whatever came in". latency=0 was measured to
                 # hold a steady {fps}fps with no added latency, which matters
                 # because the buffering on this path was deliberately shrunk
-                # from ~265ms to ~133ms to fix pointer lag — any latency
+                # from ~265ms to ~100ms to fix pointer lag — any latency
                 # given back here would undo that fix. videorate is
                 # deliberately NOT used here: with the compositor already
                 # fixing the output rate, a second element trying to
@@ -2229,32 +2232,44 @@ class ServerCore:
             return
 
         # Path 2: arm the stall watchdog.
+        # The pipeline keeps producing for ~1-2 s after MonitorsChanged before
+        # Mutter's pause actually lands, so sampling too early sees frames
+        # still advancing and bails out. Take two samples 1 s apart, both
+        # after a 2 s settle window, and only tear down if the count truly
+        # stopped moving between the samples.
         capture = self._capture
         conn = self._conn
         if capture is None or conn is None:
             return
-        baseline = capture.metrics.snapshot().get("frames_encoded", 0)
         connector = self._virtual_monitor_connector
 
-        def _check_stall():
+        def _sample_a():
             if self._capture is not capture:
-                return False  # session already torn down for another reason
-            cur = capture.metrics.snapshot().get("frames_encoded", 0)
-            if cur != baseline:
                 return False
-            if connector:
-                cur_scale = get_logical_monitor_scale(self._bus, connector)
-                if cur_scale is not None and abs(cur_scale - 1.0) > 1e-6:
-                    self._preserved_scale = cur_scale
-                    self._log(f"Preserving virtual monitor scale {cur_scale:g}× across reconnect")
-            self._log("Stream stalled after config change — reconnecting")
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+            sample_a = capture.metrics.snapshot().get("frames_encoded", 0)
+
+            def _sample_b():
+                if self._capture is not capture:
+                    return False
+                sample_b = capture.metrics.snapshot().get("frames_encoded", 0)
+                if sample_b != sample_a:
+                    return False
+                if connector:
+                    cur_scale = get_logical_monitor_scale(self._bus, connector)
+                    if cur_scale is not None and abs(cur_scale - 1.0) > 1e-6:
+                        self._preserved_scale = cur_scale
+                        self._log(f"Preserving virtual monitor scale {cur_scale:g}× across reconnect")
+                self._log("Stream stalled after config change — reconnecting")
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return False
+
+            GLib.timeout_add(1000, _sample_b)
             return False
 
-        GLib.timeout_add(1500, _check_stall)
+        GLib.timeout_add(2000, _sample_a)
 
 
     def _accept_loop(self) -> None:
