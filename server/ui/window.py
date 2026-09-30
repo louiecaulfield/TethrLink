@@ -73,9 +73,16 @@ class TethrLinkWindow(Adw.ApplicationWindow):
     # strings handed to Gtk.StringList.new() in _build_settings_group().
     _CODEC_VALUES = ("h264", "jpeg")
     _CODEC_DISPLAY = ("H.264", "JPEG")
+    # Same set GNOME Display Settings offers for a generic monitor. The
+    # server accepts arbitrary Mutter-valid floats, but pinning the UI to
+    # these keeps the choice comparable to what the user sees for their
+    # built-in display.
+    _SCALE_VALUES = (1.0, 1.25, 1.5, 1.75, 2.0)
+    _SCALE_DISPLAY = ("100%", "125%", "150%", "175%", "200%")
 
     def __init__(self, app, on_start, on_stop, on_codec_change, initial_codec="h264",
-                 on_touch_change=None, initial_touch_enabled=False):
+                 on_touch_change=None, initial_touch_enabled=False,
+                 on_scale_change=None, initial_scale=1.0):
         super().__init__(application=app, title="TethrLink")
         self.set_default_size(440, 640)
 
@@ -88,6 +95,16 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         # _on_touch_toggled below rather than defaulting to a no-op here.
         self._on_touch_change = on_touch_change
         self._initial_touch_enabled = bool(initial_touch_enabled)
+        self._on_scale_change = on_scale_change
+        # Snap the incoming scale to the nearest offered value so a
+        # settings.json with an out-of-set entry doesn't leave the ComboRow
+        # showing nothing selected.
+        try:
+            _scale = float(initial_scale)
+        except (TypeError, ValueError):
+            _scale = 1.0
+        self._initial_scale = min(self._SCALE_VALUES,
+                                  key=lambda v: abs(v - _scale))
 
         # Guards against the programmatic set_selected()/set_active() calls
         # in _refresh_settings() re-entering the user-edit handlers below —
@@ -96,11 +113,13 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         # spurious extra on_codec_change/on_touch_change calls.
         self._updating_codec = False
         self._updating_touch = False
+        self._updating_scale = False
 
         # What the user has asked for (persists across state changes; only
         # ever changed by the user via the rows below).
         self._want_codec = self._initial_codec
         self._want_touch = self._initial_touch_enabled
+        self._want_scale = self._initial_scale
 
         # Current session snapshot, refreshed only by update_status()/
         # set_server_running() — the settings rows read what is actually in
@@ -127,6 +146,7 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         # rebuilding the tree on every state change.
         self._codec_rows = []
         self._touch_rows = []
+        self._scale_rows = []
 
         # Dark forced: the product's stylesheet is a dark theme, and
         # letting the session pick light would render this window
@@ -349,6 +369,12 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         group.add(touch_row)
         self._touch_rows.append(touch_row)
 
+        scale_row = Adw.ComboRow(title="Display scale",
+                                 model=Gtk.StringList.new(list(self._SCALE_DISPLAY)))
+        scale_row.connect("notify::selected", self._on_scale_selected)
+        group.add(scale_row)
+        self._scale_rows.append(scale_row)
+
         return group
 
     def _refresh_settings(self):
@@ -387,6 +413,24 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         finally:
             self._updating_touch = False
 
+        try:
+            scale_idx = self._SCALE_VALUES.index(self._want_scale)
+        except ValueError:
+            scale_idx = 0
+        self._updating_scale = True
+        try:
+            for row in self._scale_rows:
+                row.set_selected(scale_idx)
+                # Scale is safe to change mid-session (ApplyMonitorsConfig
+                # applies live), so unlike codec/touch the row stays
+                # sensitive while a client is connected.
+                if self._connected:
+                    row.set_subtitle(f"Active · {self._SCALE_DISPLAY[scale_idx]}")
+                else:
+                    row.set_subtitle("Applies when the tablet connects")
+        finally:
+            self._updating_scale = False
+
     def _on_codec_selected(self, row, _pspec):
         if self._updating_codec:
             return
@@ -405,6 +449,18 @@ class TethrLinkWindow(Adw.ApplicationWindow):
         if self._on_touch_change:
             self._on_touch_change(self._want_touch)
         self._toast("Touch enabled" if self._want_touch else "Touch disabled")
+        self._refresh_settings()
+
+    def _on_scale_selected(self, row, _pspec):
+        if self._updating_scale:
+            return
+        idx = row.get_selected()
+        if not (0 <= idx < len(self._SCALE_VALUES)):
+            return
+        self._want_scale = self._SCALE_VALUES[idx]
+        if self._on_scale_change:
+            self._on_scale_change(self._want_scale)
+        self._toast(f"Display scale {self._SCALE_DISPLAY[idx]}")
         self._refresh_settings()
 
     # ── shared building blocks ──────────────────────────────────────────

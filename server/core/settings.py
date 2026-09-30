@@ -38,7 +38,13 @@ _APP_DIR = "tethrlink"
 # fresh install would, not some other "reasonable-looking" value.
 DEFAULT_CODEC = "h264"
 DEFAULT_TOUCH_ENABLED = False
+DEFAULT_SCALE = 1.0
 _VALID_CODECS = ("h264", "jpeg")
+# Same set GNOME's own Display Settings offers for a "generic" monitor.
+# Mutter accepts arbitrary floats via ApplyMonitorsConfig, but pinning the
+# UI to these keeps the choice comparable to what the user sees for their
+# built-in display.
+_VALID_SCALES = (1.0, 1.25, 1.5, 1.75, 2.0)
 
 
 def settings_path() -> pathlib.Path:
@@ -113,3 +119,20 @@ def resolve_touch_enabled(data: Dict[str, Any]) -> bool:
     """
     touch = data.get("touch_enabled")
     return touch if isinstance(touch, bool) else DEFAULT_TOUCH_ENABLED
+
+
+def resolve_scale(data: Dict[str, Any]) -> float:
+    """The stored virtual-monitor scale, or DEFAULT_SCALE if absent/invalid.
+
+    Coerces int-valued entries (e.g. a hand-edited "scale": 2) to float
+    while rejecting bool (True == 1.0 in Python but is almost never what
+    the user meant). Rejects values outside the offered UI set so a
+    corrupted or hand-edited unreasonable scale (e.g. 100 "meaning 100%")
+    can't produce an unusable configuration.
+    """
+    scale = data.get("scale")
+    if isinstance(scale, bool):
+        return DEFAULT_SCALE
+    if isinstance(scale, (int, float)) and float(scale) in _VALID_SCALES:
+        return float(scale)
+    return DEFAULT_SCALE

@@ -459,6 +459,11 @@ class ServerConfig:
     # at session start, so the keyframe interval follows automatically.
     fps: int = 50
     quality: int = 90
+    # Scale applied to the virtual monitor once Mutter registers it. 1.0 is
+    # a no-op; anything else is pushed via DisplayConfig.ApplyMonitorsConfig
+    # in the same handler that survives a mid-session GNOME-side scale change
+    # across a reconnect, so both entry points converge on one code path.
+    scale: float = 1.0
     # H.264 is the default as of this release, not JPEG. It used to be the
     # other way around because the H.264 path was genuinely broken — it
     # corrupted the picture. That has since been fixed: frames now travel
@@ -2178,6 +2183,33 @@ class ServerCore:
         if self._capture:
             self._capture.set_orientation(orientation == "portrait")
 
+    def set_scale(self, scale: float) -> None:
+        """Apply a new virtual-monitor scale live and update the persisted config.
+
+        Seeds `_preserved_scale` first so that if ApplyMonitorsConfig triggers
+        the same Mutter-side pause we see for GNOME-Settings-driven scale
+        changes, the stall watchdog's teardown+reconnect brings the tablet
+        back at the new scale rather than the old one.
+
+        No-ops if the current on-monitor scale already matches — Adw.ComboRow's
+        initial notify::selected fires without user input, and applying an
+        already-active scale still fires MonitorsChanged (and its brief stall)
+        for no gain.
+        """
+        self._config.scale = scale
+        if not self._bus or not self._state.running:
+            return
+        connector = self._virtual_monitor_connector
+        if connector is None or self._conn is None:
+            return  # no live session: next connection picks up config.scale
+        current = get_logical_monitor_scale(self._bus, connector)
+        if current is not None and abs(current - scale) < 1e-6:
+            return
+        if abs(scale - 1.0) > 1e-6:
+            self._preserved_scale = scale
+        if apply_logical_monitor_scale(self._bus, connector, scale):
+            self._log(f"Display scale set to {scale:g}× live")
+
     def _on_monitors_changed(self):
         """
         Fires when GNOME Display Settings applies a new monitor configuration.
@@ -2535,6 +2567,18 @@ class ServerCore:
                         return
 
                 self._log("Virtual display ready — arrange windows using System Settings > Displays")
+
+                # Seed the preserved scale from the user's configured choice
+                # if they haven't asked for 1.0 and there isn't already a
+                # scale queued from a mid-session teardown. The
+                # MonitorsChanged handler will pick this up on the first
+                # event that includes the Meta-N connector (fires shortly
+                # after the pipeline goes PLAYING) and push it via
+                # ApplyMonitorsConfig — same code path used for reconnect
+                # scale preservation.
+                if (self._preserved_scale is None
+                        and abs(self._config.scale - 1.0) > 1e-6):
+                    self._preserved_scale = self._config.scale
 
                 def _on_session_closed():
                     GLib.idle_add(_do_session_cleanup)

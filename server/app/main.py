@@ -15,7 +15,10 @@ from gi.repository import Gtk, Gio, GLib
 from server.core.server_core import (
     ServerCore, ServerConfig, ServerState, detect_codec, CODEC_H264,
 )
-from server.core.settings import load_settings, save_settings, resolve_codec, resolve_touch_enabled
+from server.core.settings import (
+    load_settings, save_settings, resolve_codec, resolve_touch_enabled,
+    resolve_scale,
+)
 from server.ui.window import TethrLinkWindow
 
 
@@ -60,6 +63,7 @@ class TethrLinkApp(Gtk.Application):
         _saved = load_settings()
         self._config.codec = detect_codec(resolve_codec(_saved))
         self._config.touch_enabled = resolve_touch_enabled(_saved)
+        self._config.scale = resolve_scale(_saved)
 
         # Codec override for testing/comparison. ServerConfig now defaults to
         # H.264; set TETHRLINK_CODEC=jpeg to fall back to the old path, or
@@ -95,6 +99,19 @@ class TethrLinkApp(Gtk.Application):
         # oversight. TETHRLINK_TOUCH=1 flips it on for a run without
         # touching the UI; malformed values are ignored with a warning,
         # same tolerance TETHRLINK_RES applies above.
+        # Scale override for testing. UI-configurable via settings.json;
+        # this knob lets scripts flip it without touching the config file.
+        _scale_env = os.environ.get("TETHRLINK_SCALE")
+        if _scale_env:
+            try:
+                self._config.scale = float(_scale_env.strip())
+                log.info("Display scale overridden via TETHRLINK_SCALE=%g",
+                         self._config.scale)
+            except ValueError:
+                log.warning(
+                    "Ignoring malformed TETHRLINK_SCALE=%r — expected a float "
+                    "(e.g. 1.5)", _scale_env)
+
         _touch_env = os.environ.get("TETHRLINK_TOUCH")
         if _touch_env:
             _touch_norm = _touch_env.strip().lower()
@@ -146,6 +163,8 @@ class TethrLinkApp(Gtk.Application):
             initial_codec=self._codec_str(),
             on_touch_change=self._on_touch_change,
             initial_touch_enabled=self._config.touch_enabled,
+            on_scale_change=self._on_scale_change,
+            initial_scale=self._config.scale,
         )
         self._window.set_server_running(False)
         self._window.present()
@@ -196,19 +215,33 @@ class TethrLinkApp(Gtk.Application):
     def _codec_str(self) -> str:
         return "h264" if self._config.codec == CODEC_H264 else "jpeg"
 
+    def _persist_settings(self):
+        save_settings({
+            "codec": self._codec_str(),
+            "touch_enabled": self._config.touch_enabled,
+            "scale": self._config.scale,
+        })
+
     def _on_codec_change(self, codec_str: str):
         self._config.codec = detect_codec(codec_str)
-        save_settings({"codec": codec_str, "touch_enabled": self._config.touch_enabled})
+        self._persist_settings()
         log.info("Codec set to %s via UI — applies to the next connection",
                  codec_str)
 
     def _on_touch_change(self, enabled: bool):
         self._config.touch_enabled = enabled
-        save_settings({"codec": self._codec_str(), "touch_enabled": enabled})
+        self._persist_settings()
         log.info(
             "Touch input %s via UI — applies to the next connection",
             "enabled" if enabled else "disabled",
         )
+
+    def _on_scale_change(self, scale: float):
+        self._config.scale = scale
+        self._persist_settings()
+        if self._core:
+            self._core.set_scale(scale)
+        log.info("Display scale set to %g× via UI", scale)
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
